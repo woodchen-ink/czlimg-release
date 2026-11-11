@@ -1,0 +1,184 @@
+name: Release
+
+# CZL 图床 Android 安装包的编译与发布。源码在私有仓库 woodchen-ink/czlimg-go, 本仓库公开 (Actions 不计分钟),
+# 按传入的 commit SHA 拉源码到 src/ → 类型检查 / lint → 签名 APK → SHA256SUMS → 同名标签 Release。
+# 安装包经 CZL Connect「发布下载」分发 (https://connect.czl.net/download/czlimg), App 内更新读 /dl/czlimg/latest.json。
+#
+#   repository_dispatch (release)  源码仓库推 android-vX.Y.Z 标签后自动转发, client_payload = ref / sha / publish
+#   workflow_dispatch              补发 / 重跑: 填源码标签; 不勾 publish 为试运行, APK 只挂在本次 Actions 的 artifact
+#
+# 版本号取自标签: android-v1.2.3 → versionName 1.2.3, versionCode 10203 (每段 < 100)
+#
+# 防泄露 (本仓库公开, 日志 / artifact / cache 对外可见):
+#   - 构建输出写入临时文件, 失败只打印错误行, 不打印带源码的 code frame
+#   - artifact 只传最终 APK; cache 只缓存 npm 与 Gradle 依赖下载
+#   - 不响应 PR 触发
+#
+# secret:
+#   SOURCE_REPO_TOKEN            fine-grained PAT, 仅 czlimg-go: Contents 只读
+#   ANDROID_KEYSTORE_BASE64      正式签名 keystore (PKCS12) 的 base64
+#   ANDROID_KEYSTORE_PASSWORD    keystore 与 key 共用密码 (别名固定 czlimg)
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 源码仓库标签, 如 android-v1.0.1
+        required: true
+      publish:
+        description: 发布为 Release
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.event.client_payload.ref || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: woodchen-ink/czlimg-go
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 解析版本
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          P_REF: ${{ github.event.client_payload.ref }}
+          P_SHA: ${{ github.event.client_payload.sha }}
+          P_PUBLISH: ${{ github.event.client_payload.publish }}
+          I_TAG: ${{ inputs.tag }}
+          I_PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [ "$EVENT" = "repository_dispatch" ]; then
+            ref="$P_REF" sha="$P_SHA" publish="$P_PUBLISH"
+          else
+            ref="$I_TAG" publish="$I_PUBLISH"
+            sha=""
+          fi
+          if [[ ! "$ref" =~ ^android-v([0-9]{1,2})\.([0-9]{1,2})\.([0-9]{1,2})(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::标签必须是 android-vX.Y.Z (每段 0-99, 可选 -pre 后缀): $ref"; exit 1
+          fi
+          name="${ref#android-v}"
+          code=$(( BASH_REMATCH[1] * 10000 + BASH_REMATCH[2] * 100 + BASH_REMATCH[3] ))
+          [ -n "$sha" ] || sha=$(gh api "repos/${SOURCE_REPO}/commits/${ref}" --jq .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::无效 commit: $sha"; exit 1; }
+          # 附注标签的说明作为 Release 正文 (轻量标签没有说明, 用默认文案)
+          obj=$(gh api "repos/${SOURCE_REPO}/git/ref/tags/${ref}" --jq '.object.type + " " + .object.sha' 2>/dev/null || true)
+          notes=""
+          if [ "${obj%% *}" = "tag" ]; then
+            notes=$(gh api "repos/${SOURCE_REPO}/git/tags/${obj#* }" --jq .message)
+          fi
+          [ -n "$notes" ] || notes="CZL 图床 Android ${name}"
+          printf '%s\n' "$notes" > "$RUNNER_TEMP/notes.md"
+          [ "$publish" = "true" ] || publish=false
+          prerelease=false; [[ "$name" == *-* ]] && prerelease=true
+          {
+            echo "ref=$ref"; echo "sha=$sha"; echo "name=$name"; echo "code=$code"
+            echo "publish=$publish"; echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 拉取源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.v.outputs.sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: src/mobile/package-lock.json
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: src/mobile/package-lock.json
+
+      - name: 安装依赖与检查
+        working-directory: src/mobile
+        run: |
+          log="$RUNNER_TEMP/check.log"
+          npm ci --no-audit --no-fund >"$log" 2>&1 || { tail -n 20 "$log" | grep -iE 'err|fail' ; echo "::error::npm ci 失败"; exit 1; }
+          # tsc --pretty false / eslint 默认格式只输出 文件:行 + 说明, 不带源码片段
+          npx tsc --noEmit --pretty false || { echo "::error::类型检查失败"; exit 1; }
+          npx eslint . || { echo "::error::eslint 失败"; exit 1; }
+
+      - name: 写入版本号并生成原生工程
+        working-directory: src/mobile
+        env:
+          NAME: ${{ steps.v.outputs.name }}
+          CODE: ${{ steps.v.outputs.code }}
+        run: |
+          jq --arg n "$NAME" --argjson c "$CODE" '.expo.version=$n | .expo.android.versionCode=$c' app.json > app.json.tmp
+          mv app.json.tmp app.json
+          CI=1 npx expo prebuild -p android --clean --no-install >"$RUNNER_TEMP/prebuild.log" 2>&1 || {
+            grep -iE 'error|failed' "$RUNNER_TEMP/prebuild.log" | head -n 20; echo "::error::prebuild 失败"; exit 1; }
+
+      - name: 编译签名 APK
+        working-directory: src/mobile/android
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          CZL_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          CZL_ANDROID_KEY_ALIAS: czlimg
+        run: |
+          export CZL_ANDROID_KEYSTORE="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$CZL_ANDROID_KEYSTORE"
+          log="$RUNNER_TEMP/gradle.log"
+          # 只出真机架构 (模拟器 x86 不发布), 一个通用 APK 便于 Connect 单别名分发
+          if ! ./gradlew assembleRelease -PreactNativeArchitectures=armeabi-v7a,arm64-v8a --no-daemon --console=plain >"$log" 2>&1; then
+            # Kotlin / Java 报错首行是 "e: 文件:行 说明" / "文件:行: error:", Metro 报错带 code frame (形如 `12 | ...`), 只输出说明
+            grep -vE '^\s*>?\s*[0-9]*\s*\|' "$log" | grep -E '^e: |error:|What went wrong|Error:' | head -n 40
+            echo "::error::Gradle 编译失败"
+            rm -f "$CZL_ANDROID_KEYSTORE"
+            exit 1
+          fi
+          rm -f "$CZL_ANDROID_KEYSTORE"
+
+      - name: 整理产物
+        id: out
+        env:
+          NAME: ${{ steps.v.outputs.name }}
+        run: |
+          mkdir dist
+          apk="dist/czlimg-android-${NAME}.apk"
+          cp src/mobile/android/app/build/outputs/apk/release/app-release.apk "$apk"
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          cat dist/SHA256SUMS
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: 试运行产物
+        if: steps.v.outputs.publish != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: czlimg-android-${{ steps.v.outputs.name }}
+          path: dist/
+          retention-days: 7
+
+      - name: 发布 Release
+        if: steps.v.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.ref }}
+          PRE: ${{ steps.v.outputs.prerelease }}
+        run: |
+          flags=(); [ "$PRE" = "true" ] && flags+=(--prerelease)
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md" -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --target main "${flags[@]}" -R "$GITHUB_REPOSITORY"
+          fi
